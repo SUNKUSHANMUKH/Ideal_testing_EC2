@@ -1,80 +1,83 @@
 # ec2_idle_check.py
-import psutil
-import time
-import json
-from datetime import datetime
+import boto3
+from datetime import datetime, timedelta, timezone
 
-CPU_THRESHOLD = 5
-MEMORY_THRESHOLD = 20
-DISK_IO_THRESHOLD = 1024
-DISK_USAGE_THRESHOLD = 20
-OBSERVATION_DURATION = 30
-SAMPLE_INTERVAL = 3
+# ----------------------------
+# CONFIGURATION
+# ----------------------------
+INSTANCE_ID = "i-0ad79521e121179ca"  # Replace with your EC2 instance ID
+IDLE_CPU_THRESHOLD = 10        # %
+IDLE_MEMORY_THRESHOLD = 30     # %
+IDLE_DISK_THRESHOLD = 30       # %
+IDLE_NETWORK_THRESHOLD = 1024  # bytes
+LOOKBACK_MINUTES = 15
 
-def get_cpu_usage():
-    return psutil.cpu_percent(interval=1)
+cw = boto3.client("cloudwatch")
 
-def get_memory_usage():
-    return psutil.virtual_memory().percent
+# ----------------------------
+# FETCH METRIC FROM CLOUDWATCH
+# ----------------------------
+def get_metric(namespace, metric, stat, dimension_name, dimension_value):
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(minutes=LOOKBACK_MINUTES)
 
-def get_disk_io():
-    disk1 = psutil.disk_io_counters()
-    read1, write1 = disk1.read_bytes, disk1.write_bytes
-    time.sleep(1)
-    disk2 = psutil.disk_io_counters()
-    read2, write2 = disk2.read_bytes, disk2.write_bytes
-    return read2 - read1, write2 - write1
+    response = cw.get_metric_statistics(
+        Namespace=namespace,
+        MetricName=metric,
+        Dimensions=[{"Name": dimension_name, "Value": dimension_value}],
+        StartTime=start,
+        EndTime=end,
+        Period=300,
+        Statistics=[stat],
+    )
 
-def get_disk_usage():
-    return psutil.disk_usage('/').percent
+    datapoints = response.get("Datapoints", [])
+    if not datapoints:
+        return None
+    return datapoints[-1][stat]
 
-def get_network_usage():
-    net1 = psutil.net_io_counters()
-    n1_in, n1_out = net1.bytes_recv, net1.bytes_sent
-    time.sleep(1)
-    net2 = psutil.net_io_counters()
-    n2_in, n2_out = net2.bytes_recv, net2.bytes_sent
-    return n2_in - n1_in, n2_out - n1_out
+# ----------------------------
+# GET METRICS
+# ----------------------------
+def get_cpu(): return get_metric("AWS/EC2", "CPUUtilization", "Average", "InstanceId", INSTANCE_ID)
+def get_network_in(): return get_metric("AWS/EC2", "NetworkIn", "Sum", "InstanceId", INSTANCE_ID)
+def get_network_out(): return get_metric("AWS/EC2", "NetworkOut", "Sum", "InstanceId", INSTANCE_ID)
+def get_ebs_read_ops(): return get_metric("AWS/EC2", "EBSReadOps", "Sum", "InstanceId", INSTANCE_ID)
+def get_ebs_write_ops(): return get_metric("AWS/EC2", "EBSWriteOps", "Sum", "InstanceId", INSTANCE_ID)
+def get_memory(): return get_metric("CWAgent", "mem_used_percent", "Average", "InstanceId", INSTANCE_ID)
+def get_disk(): return get_metric("CWAgent", "disk_used_percent", "Average", "InstanceId", INSTANCE_ID)
 
-def determine_idle(cpu, memory, disk_read, disk_write):
-    return cpu < CPU_THRESHOLD and memory < MEMORY_THRESHOLD and disk_read < DISK_IO_THRESHOLD and disk_write < DISK_IO_THRESHOLD
+# ----------------------------
+# EVALUATE IDLE
+# ----------------------------
+def evaluate_idle(cpu, mem, disk, net_in, net_out, ebs_read, ebs_write):
+    idle_cpu = cpu is not None and cpu < IDLE_CPU_THRESHOLD
+    idle_mem = mem is not None and mem < IDLE_MEMORY_THRESHOLD
+    idle_disk = disk is not None and disk < IDLE_DISK_THRESHOLD
+    idle_net = (net_in is not None and net_in < IDLE_NETWORK_THRESHOLD) and (net_out is not None and net_out < IDLE_NETWORK_THRESHOLD)
+    idle_ebs = (ebs_read is not None and ebs_read < 10) and (ebs_write is not None and ebs_write < 10)
+    return "IDLE" if idle_cpu and idle_mem and idle_disk and idle_net and idle_ebs else "ACTIVE"
 
+# ----------------------------
+# MAIN
+# ----------------------------
 if __name__ == "__main__":
-    print("Monitoring EC2 machine locally for idle detection...")
-    cpu_samples, memory_samples, disk_read_samples, disk_write_samples = [], [], [], []
+    cpu = get_cpu()
+    mem = get_memory()
+    disk = get_disk()
+    net_in = get_network_in()
+    net_out = get_network_out()
+    ebs_read = get_ebs_read_ops()
+    ebs_write = get_ebs_write_ops()
 
-    start_time = datetime.now()
+    print("----- METRICS -----")
+    print(f"CPU: {cpu}")
+    print(f"Memory: {mem}")
+    print(f"Disk % used: {disk}")
+    print(f"Network In: {net_in}")
+    print(f"Network Out: {net_out}")
+    print(f"EBS Read Ops: {ebs_read}")
+    print(f"EBS Write Ops: {ebs_write}")
 
-    for _ in range(int(OBSERVATION_DURATION / SAMPLE_INTERVAL)):
-        cpu = get_cpu_usage()
-        mem = get_memory_usage()
-        d_read, d_write = get_disk_io()
-
-        cpu_samples.append(cpu)
-        memory_samples.append(mem)
-        disk_read_samples.append(d_read)
-        disk_write_samples.append(d_write)
-
-        print(f"[Sample] CPU: {cpu}%, MEM: {mem}%, READ: {d_read} B/s, WRITE: {d_write} B/s")
-
-    avg_cpu = sum(cpu_samples)/len(cpu_samples)
-    avg_mem = sum(memory_samples)/len(memory_samples)
-    avg_read = sum(disk_read_samples)/len(disk_read_samples)
-    avg_write = sum(disk_write_samples)/len(disk_write_samples)
-    disk_usage = get_disk_usage()
-    net_in, net_out = get_network_usage()
-
-    idle_status = determine_idle(avg_cpu, avg_mem, avg_read, avg_write)
-
-    result = {
-         "timestamp": str(start_time),
-         "average_cpu_percent": avg_cpu,
-         "average_memory_percent": avg_mem,
-         "average_disk_read_Bps": avg_read,
-         "average_disk_write_Bps": avg_write,
-         "disk_usage_percent": disk_usage,
-         "network_in_Bps": net_in,
-         "network_out_Bps": net_out,
-         "is_idle": idle_status
-    }
-
+    status = evaluate_idle(cpu, mem, disk, net_in, net_out, ebs_read, ebs_write)
+    print(f"\nINSTANCE STATUS: {status}")
